@@ -76,26 +76,78 @@ instead.
 
 ## 5. The cross-platform desktop exception
 
-Dagger's container model is fundamentally Linux/OCI. It has no path to
-macOS code signing/notarization, Windows `signtool`, or per-platform native
-module rebuilds (e.g. node-pty, Tauri's Rust toolchain) — those need the
-real OS. Cross-platform desktop apps (Quintodrome, Hyper) are the explicit
-exception to "everything through Dagger":
+Dagger's execution model is Linux/OCI containers. There is no Windows-container
+execution mode in Dagger, and no native-macOS-app-building container mode
+either. Running the Dagger *client* from a Windows or Mac host (which does
+work) just dispatches into a Linux VM underneath (WSL2, Docker Desktop,
+etc.) — that doesn't change the target you're building for.
+
+**But check how much of this is actually a container-engine limitation
+before reaching for a native runner matrix — less than it looks like:**
+
+- **Windows: cross-compile from inside the Dagger Linux container first.**
+  Go cross-compiles to Windows trivially (`GOOS=windows`). Rust/Tauri
+  cross-compiles via [`cargo-xwin`](https://github.com/Jake-Shadle/xwin)
+  (MSVC target) or mingw-w64 (GNU target) — Tauri has first-class support
+  for this (`tauri build --runner cargo-xwin --target
+  x86_64-pc-windows-msvc`). Authenticode signing doesn't need `signtool` or
+  a Windows host either: `osslsigncode` signs PE/MSI/CAB files from Linux,
+  including against a real HSM-backed cert via PKCS11. Put together, this
+  likely covers the *entire* Windows leg (build + sign) inside Dagger, with
+  no native Windows runner at all — try this before assuming the matrix
+  approach quintodrome's `desktop.yml` currently uses is necessary. The one
+  soft spot is native Node module rebuilds (e.g. node-pty, for Hyper):
+  cross-compiling node-gyp addons to Windows from Linux is less reliable
+  per-dependency, so that leg specifically may still need a real Windows
+  runner — check it, don't assume either way.
+- **macOS: don't cross-compile, and this isn't a Dagger limitation to wait
+  out.** `osxcross` exists, but it works by extracting Apple's SDK, and
+  Apple's EULA restricts that SDK to execution on Apple-branded hardware —
+  not something to adopt as org policy. More fundamentally, codesigning and
+  notarization need Apple's own tools (`codesign`, `notarytool`) talking to
+  Apple's signing infrastructure with real credentials — that's a
+  credentials/API constraint, not a sandboxing one, so no amount of
+  container tech (present or future) removes the need for a real Mac for
+  that step. Apple's `container` project (WWDC 2025, the subject of
+  [dagger/dagger#11205](https://github.com/dagger/dagger/issues/11205) on
+  adding it as a Dagger runtime) doesn't change this either: it runs
+  *Linux* containers natively on Apple Silicon (one lightweight VM per
+  container, via `Virtualization.framework`), which would make running
+  Dagger's existing Linux pipelines on a Mac host faster/more native — it
+  is not a way to build or sign macOS apps inside a container. Keep the
+  native macOS runner for this leg.
+- **There's no "Dagger for Windows containers" to switch to, either.**
+  BuildKit (the engine Dagger is built on) added *experimental* Windows
+  container support in v0.13, but Dagger hasn't built Windows-container
+  execution on top of it, and general Windows-native CI platforms (Azure
+  DevOps, TeamCity) aren't containerized-pipeline-as-code tools the way
+  Dagger is — they're a different trade-off, not a drop-in replacement.
+
+So: cross-platform desktop apps (Quintodrome, Hyper) remain the exception to
+"everything through Dagger" — but narrower than it first appears. Try to
+collapse the Windows leg into Dagger via cross-compilation before matrixing
+it onto a native `windows-latest` runner; keep the macOS leg (and whichever
+Node-native-module rebuilds don't cross-compile cleanly) on real runners,
+since that part isn't going away. Re-verify this against Dagger's current
+docs before trusting it indefinitely — this is a fast-moving project — but
+the macOS signing constraint specifically is structural, not a version gap.
 
 - Keep Dagger for whatever portion *is* containerizable — a Go/Node
   server-side build, lint, or test job stays thin-Gitea-Actions-calls-Dagger
-  as normal.
-- The actual cross-platform packaging job gets a real OS matrix in Gitea
-  Actions (`macos-latest`, `macos-13` for Intel, `windows-latest`) with
-  native toolchain setup steps (Node, Go, Rust, mingw-w64 for Windows CGO) —
-  this is allowed to be as "fat" as it needs to be, since there's no Dagger
-  path to thin it against.
+  as normal, and per the above, try to pull the Windows build+sign leg in
+  here too rather than defaulting it onto a native runner.
+- Whatever's left over (macOS always; Windows only for legs that genuinely
+  don't cross-compile) gets a real OS matrix in Gitea Actions (`macos-latest`,
+  `macos-13` for Intel, and `windows-latest` only if needed) with native
+  toolchain setup steps. This is allowed to be as "fat" as it needs to be,
+  since there's no Dagger path to thin it against.
 - Mark this divergence explicitly in the workflow (a comment explaining why
   Dagger isn't used there) so it reads as a deliberate, bounded exception
   rather than unexplained drift from the Dagger-first rule.
-- Electron apps follow the same shape: native per-arch rebuilds and
-  OS-specific signing/notarization mean packaging CI stays on real runners
-  too, even once migrated off GitHub Actions onto Forgejo.
+- Electron apps follow the same shape: macOS signing/notarization and
+  whichever native per-arch module rebuilds don't cross-compile cleanly mean
+  that part of packaging CI stays on real runners, even once migrated off
+  GitHub Actions onto Forgejo.
 
 ## 6. Mark Taskfiles and Dagger files as part of Quine OS
 
